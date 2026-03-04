@@ -37,7 +37,9 @@ impl Default for WasmChannelRuntimeConfig {
             default_limits: ResourceLimits {
                 // Channels may need more memory for message buffering
                 memory_bytes: 50 * 1024 * 1024, // 50 MB
-                fuel: 10_000_000,
+                // Audio attachments (base64 decode + multipart assembly) are CPU-heavy.
+                // Keep channel callbacks safe but give enough headroom for voice replies.
+                fuel: 100_000_000,
                 timeout: Duration::from_secs(60),
             },
             fuel_config: FuelConfig::default(),

@@ -432,6 +432,15 @@ fn parse_data_url_audio(data_url: &str) -> Result<(String, Vec<u8>), String> {
         .unwrap_or("audio/mpeg")
         .to_string();
 
+    let payload = payload.trim();
+    let estimated_decoded_bytes = (payload.len() as u64).saturating_mul(3) / 4;
+    if estimated_decoded_bytes > MAX_VOICE_BYTES {
+        return Err(format!(
+            "audio attachment too large (estimated {} bytes > {} bytes)",
+            estimated_decoded_bytes, MAX_VOICE_BYTES
+        ));
+    }
+
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(payload)
         .map_err(|err| format!("invalid base64 audio payload: {}", err))?;
@@ -816,11 +825,23 @@ impl Guest for TelegramChannel {
             }
         }
 
-        for attachment in response.attachments {
+        for (index, attachment) in response.attachments.iter().enumerate() {
+            let preview: String = attachment.chars().take(32).collect();
+            channel_host::log(
+                channel_host::LogLevel::Info,
+                &format!(
+                    "Processing attachment {} for chat {} (len={}, prefix={})",
+                    index,
+                    metadata.chat_id,
+                    attachment.len(),
+                    preview
+                ),
+            );
+
             let delivery = if attachment.starts_with("data:audio/") {
-                send_voice_data_url(metadata.chat_id, &attachment, Some(metadata.message_id))
+                send_voice_data_url(metadata.chat_id, attachment, Some(metadata.message_id))
             } else if attachment.starts_with("data:") {
-                send_document_data_url(metadata.chat_id, &attachment, Some(metadata.message_id))
+                send_document_data_url(metadata.chat_id, attachment, Some(metadata.message_id))
             } else {
                 Err("Unsupported attachment payload; expected data URL".to_string())
             };

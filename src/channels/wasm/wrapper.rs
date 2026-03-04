@@ -950,7 +950,7 @@ impl WasmChannel {
     /// Map WASM execution errors to our error types.
     fn map_wasm_error(e: anyhow::Error, name: &str, fuel_limit: u64) -> WasmChannelError {
         let error_str = e.to_string();
-        if error_str.contains("out of fuel") {
+        if error_str.contains("out of fuel") || error_str.contains("all fuel consumed") {
             WasmChannelError::FuelExhausted {
                 name: name.to_string(),
                 limit: fuel_limit,
@@ -1334,6 +1334,16 @@ impl WasmChannel {
             thread_id = ?thread_id,
             "call_on_respond invoked"
         );
+        if !attachments.is_empty() {
+            let first_attachment_len = attachments.first().map(|value| value.len()).unwrap_or(0);
+            let total_attachment_bytes: usize = attachments.iter().map(|value| value.len()).sum();
+            tracing::info!(
+                channel = %self.name,
+                first_attachment_len,
+                total_attachment_bytes,
+                "on_respond attachment payload summary"
+            );
+        }
 
         // Log credentials state (without values)
         let creds = self.get_credentials().await;
