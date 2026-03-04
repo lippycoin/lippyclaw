@@ -46,6 +46,12 @@ const mentorVoiceApiKey =
   "";
 const mentorVoiceRunEndpoint =
   process.env.MENTOR_CHUTES_RUN_ENDPOINT || `${mentorVoiceBaseUrl}/run`;
+const mentorWhisperEndpoint =
+  process.env.MENTOR_CHUTES_WHISPER_ENDPOINT || "https://chutes-whisper-large-v3.chutes.ai/transcribe";
+const mentorCsmEndpoint =
+  process.env.MENTOR_CHUTES_CSM_ENDPOINT || "https://chutes-csm-1b.chutes.ai/speak";
+const mentorKokoroEndpoint =
+  process.env.MENTOR_CHUTES_KOKORO_ENDPOINT || "https://chutes-kokoro.chutes.ai/speak";
 const mentorWhisperModel =
   process.env.MENTOR_CHUTES_WHISPER_MODEL || "openai/whisper-large-v3-turbo";
 const mentorCloneModel = process.env.MENTOR_CHUTES_CSM_MODEL || "sesame/csm-1b";
@@ -337,6 +343,48 @@ const callChutesRunModel = async (model, input) => {
   return response.json();
 };
 
+const callChutesDirectJson = async (endpoint, payload, label) => {
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${mentorVoiceApiKey}`,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`Chutes direct ${label} failed (${response.status}) endpoint=${endpoint}: ${errorBody.slice(0, 300)}`);
+  }
+
+  return response.json();
+};
+
+const callChutesDirectAudio = async (endpoint, payload, label) => {
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${mentorVoiceApiKey}`,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`Chutes direct ${label} failed (${response.status}) endpoint=${endpoint}: ${errorBody.slice(0, 300)}`);
+  }
+
+  const contentType = response.headers.get("content-type") || "";
+  if (contentType.includes("application/json")) {
+    const payloadJson = await response.json();
+    return extractAudioBufferFromPayload(payloadJson);
+  }
+
+  return Buffer.from(await response.arrayBuffer());
+};
+
 const transcribeBufferOpenAICompatible = async (audioBuffer, mimeType) => {
   const form = new FormData();
   const ext = mimeType.includes("mpeg") || mimeType.includes("mp3") ? "mp3" : "ogg";
@@ -375,11 +423,43 @@ const transcribeBuffer = async (audioBuffer, mimeType, language) => {
     return transcribeBufferOpenAICompatible(audioBuffer, mimeType);
   }
 
-  const payload = await callChutesRunModel(mentorWhisperModel, {
-    audio_base64: audioBuffer.toString("base64"),
-    mime_type: mimeType,
-    language,
-  });
+  if (mentorVoiceMode === "chutes_direct") {
+    const payload = await callChutesDirectJson(
+      mentorWhisperEndpoint,
+      {
+        audio_b64: audioBuffer.toString("base64"),
+        language: language ?? null,
+      },
+      "whisper",
+    );
+    const text = extractTextFromPayload(payload);
+    if (!text) {
+      throw new Error("Chutes direct whisper response did not include transcript text.");
+    }
+    return text;
+  }
+
+  let payload;
+  try {
+    payload = await callChutesRunModel(mentorWhisperModel, {
+      audio_base64: audioBuffer.toString("base64"),
+      mime_type: mimeType,
+      language,
+    });
+  } catch (error) {
+    if (mentorWhisperEndpoint) {
+      payload = await callChutesDirectJson(
+        mentorWhisperEndpoint,
+        {
+          audio_b64: audioBuffer.toString("base64"),
+          language: language ?? null,
+        },
+        "whisper",
+      );
+    } else {
+      throw error;
+    }
+  }
 
   const text = extractTextFromPayload(payload);
   if (!text) {
@@ -435,18 +515,46 @@ const synthesizeWithCloneModel = async (text, contextText, sampleAudioBuffer) =>
     );
   }
 
-  const payload = await callChutesRunModel(mentorCloneModel, {
-    text,
-    target_text: text,
-    text_context: contextText,
-    context_text: contextText,
-    audio_context_base64: sampleAudioBase64,
-    context_audio_base64: sampleAudioBase64,
-    format: "mp3",
-    output_format: "mp3",
-  });
+  if (mentorVoiceMode === "chutes_direct") {
+    return callChutesDirectAudio(
+      mentorCsmEndpoint,
+      {
+        text,
+        max_duration_ms: 10000,
+        audio_b64: sampleAudioBase64,
+        context_text: contextText,
+      },
+      "csm speak",
+    );
+  }
 
-  return extractAudioBufferFromPayload(payload);
+  try {
+    const payload = await callChutesRunModel(mentorCloneModel, {
+      text,
+      target_text: text,
+      text_context: contextText,
+      context_text: contextText,
+      audio_context_base64: sampleAudioBase64,
+      context_audio_base64: sampleAudioBase64,
+      format: "mp3",
+      output_format: "mp3",
+    });
+    return extractAudioBufferFromPayload(payload);
+  } catch (error) {
+    if (mentorCsmEndpoint) {
+      return callChutesDirectAudio(
+        mentorCsmEndpoint,
+        {
+          text,
+          max_duration_ms: 10000,
+          audio_b64: sampleAudioBase64,
+          context_text: contextText,
+        },
+        "csm speak",
+      );
+    }
+    throw error;
+  }
 };
 
 const synthesizeWithKokoro = async (text) => {
@@ -454,13 +562,37 @@ const synthesizeWithKokoro = async (text) => {
     return synthesizeWithOpenAICompatibleSpeech(mentorKokoroModel, text, "", "");
   }
 
-  const payload = await callChutesRunModel(mentorKokoroModel, {
-    text,
-    format: "mp3",
-    output_format: "mp3",
-  });
+  if (mentorVoiceMode === "chutes_direct") {
+    return callChutesDirectAudio(
+      mentorKokoroEndpoint,
+      {
+        text,
+        speed: 1,
+      },
+      "kokoro speak",
+    );
+  }
 
-  return extractAudioBufferFromPayload(payload);
+  try {
+    const payload = await callChutesRunModel(mentorKokoroModel, {
+      text,
+      format: "mp3",
+      output_format: "mp3",
+    });
+    return extractAudioBufferFromPayload(payload);
+  } catch (error) {
+    if (mentorKokoroEndpoint) {
+      return callChutesDirectAudio(
+        mentorKokoroEndpoint,
+        {
+          text,
+          speed: 1,
+        },
+        "kokoro speak",
+      );
+    }
+    throw error;
+  }
 };
 
 const loadPersona = async () => {
@@ -688,6 +820,9 @@ const handleMentorStatus = async () => {
       mode: mentorVoiceMode,
       apiBaseUrl: mentorVoiceBaseUrl,
       runEndpoint: mentorVoiceRunEndpoint,
+      whisperEndpoint: mentorWhisperEndpoint,
+      csmEndpoint: mentorCsmEndpoint,
+      kokoroEndpoint: mentorKokoroEndpoint,
       apiKeyConfigured: mentorVoiceApiKey.length > 0,
       whisperModel: mentorWhisperModel,
       cloneModel: mentorCloneModel,
