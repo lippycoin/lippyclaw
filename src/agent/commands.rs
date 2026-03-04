@@ -501,6 +501,8 @@ impl Agent {
                 "  /heartbeat        Run heartbeat check\n",
                 "  /summarize        Summarize current thread\n",
                 "  /suggest          Suggest next steps\n",
+                "  /mentor <msg>     Ask mentor (text route)\n",
+                "  /mentor_voice <m> Ask mentor (voice-preferred route)\n",
                 "\n",
                 "  /quit             Exit",
             ))),
@@ -608,9 +610,36 @@ impl Agent {
                 }
             }
 
+            "mentor" => {
+                let message = args.join(" ").trim().to_string();
+                if message.is_empty() {
+                    Ok(SubmissionResult::response(
+                        "Usage: /mentor <message>",
+                    ))
+                } else {
+                    Ok(SubmissionResult::response(format!(
+                        "Mentor request received. Send this as plain text if your channel does not support mentor command routing:\n\n{}",
+                        message
+                    )))
+                }
+            }
+
+            "mentor_voice" => {
+                let message = args.join(" ").trim().to_string();
+                if message.is_empty() {
+                    Ok(SubmissionResult::response(
+                        "Usage: /mentor_voice <message>",
+                    ))
+                } else {
+                    Ok(SubmissionResult::response(format!(
+                        "Mentor voice request received. If voice response is configured, ask with plain text:\n\nMentor voice request: {}",
+                        message
+                    )))
+                }
+            }
+
             _ => Ok(SubmissionResult::error(format!(
-                "Unknown command: {}. Try /help",
-                command
+                "Unknown command. Try /help"
             ))),
         }
     }

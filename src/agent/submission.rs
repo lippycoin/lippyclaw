@@ -43,6 +43,30 @@ impl SubmissionParser {
         if lower == "/thread new" || lower == "/new" {
             return Submission::NewThread;
         }
+        // Mentor aliases: route to normal user input so they work across channels
+        // without requiring channel-specific command routers.
+        if let Some(rest) = trimmed.strip_prefix("/mentor_voice") {
+            let msg = rest.trim();
+            if msg.is_empty() {
+                return Submission::UserInput {
+                    content: "Mentor voice usage: /mentor_voice <message>".to_string(),
+                };
+            }
+            return Submission::UserInput {
+                content: format!("Mentor voice request: {}", msg),
+            };
+        }
+        if let Some(rest) = trimmed.strip_prefix("/mentor") {
+            let msg = rest.trim();
+            if msg.is_empty() {
+                return Submission::UserInput {
+                    content: "Mentor usage: /mentor <message>".to_string(),
+                };
+            }
+            return Submission::UserInput {
+                content: format!("Mentor request: {}", msg),
+            };
+        }
         // System commands (bypass thread-state checks)
         if lower == "/help" || lower == "/?" {
             return Submission::SystemCommand {

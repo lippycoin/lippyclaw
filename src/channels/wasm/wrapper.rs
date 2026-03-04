@@ -489,7 +489,15 @@ impl near::agent::channel_host::Host for ChannelStoreData {
                 } else {
                     body_str.to_string()
                 };
-                tracing::debug!(body = %truncated, "Response body");
+                if status >= 400 {
+                    tracing::warn!(
+                        status = status,
+                        body = %truncated,
+                        "HTTP non-success response body"
+                    );
+                } else {
+                    tracing::debug!(body = %truncated, "Response body");
+                }
             }
 
             // Leak detection on response body (best-effort)
