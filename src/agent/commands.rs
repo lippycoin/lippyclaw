@@ -45,14 +45,12 @@ fn format_count(n: u64, suffix: &str) -> String {
 fn mentor_error_summary(error: &str) -> String {
     let lower = error.to_lowercase();
     if lower.contains("timeout") || lower.contains("timed out") {
-        "mcp_transport_error: Mentor MCP transport timeout. Text fallback is active."
-            .to_string()
+        "mcp_transport_error: Mentor MCP transport timeout. Text fallback is active.".to_string()
     } else if lower.contains("invalid params") || lower.contains("schema") {
         "mcp_schema_error: Mentor tool schema error. Check mentor MCP argument contract."
             .to_string()
     } else if lower.contains("transcribe") || lower.contains("whisper") {
-        "stt_backend_error: Voice STT backend error while processing the voice note."
-            .to_string()
+        "stt_backend_error: Voice STT backend error while processing the voice note.".to_string()
     } else if lower.contains("speak")
         || lower.contains("voice")
         || lower.contains("kokoro")
@@ -174,14 +172,54 @@ fn mentor_context_from_message(message: Option<&IncomingMessage>) -> MentorConte
 }
 
 fn extract_mentor_reply(payload: &serde_json::Value) -> String {
-    payload
+    let raw = payload
         .get("reply")
         .and_then(|value| value.as_str())
         .or_else(|| payload.get("text").and_then(|value| value.as_str()))
         .or_else(|| payload.get("content").and_then(|value| value.as_str()))
-        .unwrap_or_default()
-        .trim()
-        .to_string()
+        .unwrap_or_default();
+
+    let stripped = strip_minimax_tool_calls(raw);
+    let trimmed = stripped.trim();
+    if trimmed.is_empty() {
+        "Mentor returned no usable reply. Please retry.".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn strip_minimax_tool_calls(input: &str) -> String {
+    const TOOL_CALL_OPEN: &str = "<minimax:tool_call>";
+    const TOOL_CALL_CLOSE: &str = "</minimax:tool_call>";
+    const TOOLCALL_OPEN: &str = "<minimax:toolcall>";
+    const TOOLCALL_CLOSE: &str = "</minimax:toolcall>";
+
+    fn remove_block(source: &str, open: &str, close: &str) -> String {
+        let mut remaining = source;
+        let mut output = String::with_capacity(source.len());
+
+        loop {
+            let Some(start) = remaining.find(open) else {
+                output.push_str(remaining);
+                break;
+            };
+
+            output.push_str(&remaining[..start]);
+            let block = &remaining[start..];
+            if let Some(close_idx) = block.find(close) {
+                let after = close_idx + close.len();
+                remaining = &block[after..];
+            } else {
+                // Drop trailing unmatched tool-call block.
+                break;
+            }
+        }
+
+        output
+    }
+
+    let without_tool_call = remove_block(input, TOOL_CALL_OPEN, TOOL_CALL_CLOSE);
+    remove_block(&without_tool_call, TOOLCALL_OPEN, TOOLCALL_CLOSE)
 }
 
 fn enforce_voice_reply_style(reply: &str) -> String {
@@ -995,7 +1033,19 @@ impl Agent {
             "tool_name": tool_name,
         });
 
-        let output = tokio::time::timeout(Duration::from_secs(60), async {
+        let voice_reply_requested = params
+            .get("voiceReply")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let timeout_secs = if logical_tool_name == "mentor.chat" && voice_reply_requested {
+            180
+        } else if logical_tool_name == "mentor.speak" {
+            180
+        } else {
+            60
+        };
+
+        let output = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
             tool.execute(params, &job_ctx).await
         })
         .await
