@@ -1,6 +1,6 @@
 # Mentor Agent Directory
 
-This directory contains the Mentor AI configuration files.
+This directory contains the Mentor AI configuration files for voice note processing.
 
 ## Required Files
 
@@ -15,7 +15,7 @@ Explicit instructions on how to evaluate the Main Agent's actions.
 - **Format**: Markdown with capability descriptions
 
 ### master-voice.wav (Required for Voice Mode)
-Reference audio sample for zero-shot voice cloning via Chutes.ai.
+Reference audio sample for zero-shot voice cloning via Chutes.ai CSM-1B model.
 
 **Requirements:**
 - **Format**: WAV, 16-bit, 22050Hz or 44100Hz
@@ -23,20 +23,12 @@ Reference audio sample for zero-shot voice cloning via Chutes.ai.
 - **Content**: Clean speech without background noise
 - **File size**: Max 10MB
 
-**How to create:**
-1. Record 10-15 seconds of clear speech
-2. Export as WAV format (no compression)
-3. Place in this directory as `master-voice.wav`
-4. (Optional) Generate SHA256 checksum for verification:
-   ```bash
-   sha256sum master-voice.wav
-   ```
-5. Add checksum to `docker-compose.yml` as `MASTER_VOICE_CHECKSUM`
+**Note:** The voice sample file is already placed at `/mentor/master-voice.wav` in the lippyclaw directory.
 
-**Security:**
-- This file is read-only for the Mentor worker
-- Cannot be modified or deleted by any agent
-- Checksum verification prevents tampering
+**Security (Optional):**
+- SHA256 checksum verification is available but NOT required
+- Only used if `MASTER_VOICE_CHECKSUM` environment variable is set
+- To enable: `sha256sum master-voice.wav` and add to docker-compose.yml
 
 ## Directory Permissions
 
@@ -46,16 +38,81 @@ Reference audio sample for zero-shot voice cloning via Chutes.ai.
 | skills.md | Mentor | ❌ | ❌ |
 | master-voice.wav | Mentor, chutes_tts | ❌ | ❌ |
 
-## Usage
+## Quick Start - Running with ghostclaw.sh
 
-The Mentor worker reads these files at startup:
-1. `persona.md` → System prompt identity
-2. `skills.md` → Capability instructions  
-3. `master-voice.wav` → Voice cloning reference (if voice mode enabled)
+The lippyclaw voice system integrates with the existing ghostclaw.sh workflow.
 
-To enable voice mode, set in docker-compose.yml:
-```yaml
-environment:
-  - MENTOR_VOICE_MODE=enabled
-  - CHUTES_API_KEY=your_api_key
+### Prerequisites
+
+1. **CHUTES_API_KEY** must be set in your `.env` file (already configured)
+2. **master-voice.wav** must exist (already at `lippyclaw/mentor/master-voice.wav`)
+
+### Build and Run
+
+```bash
+# From the ghostclaw root directory (/Users/mac/Documents/ironclaw)
+
+# 1. Build all images (including mentor-mcp)
+./scripts/ghostclaw.sh build
+
+# 2. Start the stack (auto-detects voice sample)
+./scripts/ghostclaw.sh up
+
+# 3. Check health
+./scripts/ghostclaw.sh health
 ```
+
+### Voice Note Flow
+
+1. Send a voice note to your Telegram bot
+2. ghostclaw receives it via webhook
+3. mentor-mcp transcribes via Chutes.ai Whisper
+4. Mentor AI evaluates the transcription
+5. Response is synthesized using your cloned voice
+6. Voice note is sent back to Telegram
+
+### Manual Voice Bootstrap (if needed)
+
+```bash
+# Manually bootstrap voice context
+./scripts/ghostclaw.sh mentor:clone /Users/mac/Documents/ironclaw/lippyclaw/mentor/master-voice.wav
+```
+
+### Troubleshooting
+
+```bash
+# Check mentor-mcp logs
+./scripts/ghostclaw.sh logs mentor-mcp
+
+# Check ironclaw logs
+./scripts/ghostclaw.sh logs ironclaw
+
+# Restart with fresh voice sync
+./scripts/ghostclaw.sh restart
+```
+
+## Architecture
+
+```
+Telegram Voice Note (.ogg)
+         ↓
+   ghostclaw.sh (orchestrator)
+         ↓
+   mentor-mcp (Node.js MCP server)
+         ↓
+   chutes_stt (WASM) → Chutes.ai Whisper → Transcription
+         ↓
+   Mentor AI (evaluation)
+         ↓
+   chutes_tts (WASM) → Chutes.ai CSM-1B → Voice Response (.wav)
+         ↓
+   Telegram sendVoice API → User receives voice reply
+```
+
+## Configuration
+
+Voice mode is enabled by default when:
+- `ENABLE_MENTOR_VOICE=true` in `.env`
+- `MENTOR_AUTO_BOOTSTRAP_VOICE=true` in `.env`
+- `CHUTES_API_KEY` is configured
+- `master-voice.wav` file exists
