@@ -970,7 +970,17 @@ async fn setup_wasm_channels(
                 .map(|s| s.expose().to_string())
         } else {
             None
-        };
+        }
+        .or_else(|| std::env::var(secret_name.to_ascii_uppercase()).ok())
+        .or_else(|| {
+            if channel_name.eq_ignore_ascii_case("telegram") {
+                std::env::var("TELEGRAM_WEBHOOK_SECRET")
+                    .ok()
+                    .or_else(|| std::env::var("HTTP_WEBHOOK_SECRET").ok())
+            } else {
+                None
+            }
+        });
 
         let secret_header = loaded.webhook_secret_header().map(|s| s.to_string());
 

@@ -2371,7 +2371,17 @@ impl ExtensionManager {
             .get_decrypted(&self.user_id, &webhook_secret_name)
             .await
             .ok()
-            .map(|s| s.expose().to_string());
+            .map(|s| s.expose().to_string())
+            .or_else(|| std::env::var(webhook_secret_name.to_ascii_uppercase()).ok())
+            .or_else(|| {
+                if channel_name.eq_ignore_ascii_case("telegram") {
+                    std::env::var("TELEGRAM_WEBHOOK_SECRET")
+                        .ok()
+                        .or_else(|| std::env::var("HTTP_WEBHOOK_SECRET").ok())
+                } else {
+                    None
+                }
+            });
 
         let channel_arc = Arc::new(loaded.channel);
 
@@ -2581,6 +2591,26 @@ impl ExtensionManager {
             config_updates.insert(
                 "webhook_secret".to_string(),
                 serde_json::Value::String(secret.expose().to_string()),
+            );
+            existing_channel.update_config(config_updates).await;
+        } else if let Some(secret) = std::env::var(webhook_secret_name.to_ascii_uppercase())
+            .ok()
+            .or_else(|| {
+                if name.eq_ignore_ascii_case("telegram") {
+                    std::env::var("TELEGRAM_WEBHOOK_SECRET")
+                        .ok()
+                        .or_else(|| std::env::var("HTTP_WEBHOOK_SECRET").ok())
+                } else {
+                    None
+                }
+            })
+        {
+            router.update_secret(name, secret.clone()).await;
+
+            let mut config_updates = std::collections::HashMap::new();
+            config_updates.insert(
+                "webhook_secret".to_string(),
+                serde_json::Value::String(secret),
             );
             existing_channel.update_config(config_updates).await;
         }
