@@ -367,6 +367,8 @@ const stripMinimaxToolCalls = (input) => {
   return input
     .replace(/<minimax:tool_call\b[^>]*>[\s\S]*?<\/minimax:tool_call>/gi, "")
     .replace(/<minimax:toolcall\b[^>]*>[\s\S]*?<\/minimax:toolcall>/gi, "")
+    .replace(/<think\b[^>]*>[\s\S]*?<\/think>/gi, "")
+    .replace(/<thinking\b[^>]*>[\s\S]*?<\/thinking>/gi, "")
     .trim();
 };
 
