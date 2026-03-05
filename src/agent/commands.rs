@@ -52,7 +52,14 @@ fn mentor_error_summary(error: &str) -> String {
     };
 
     let lower = error.to_lowercase();
-    if lower.contains("timeout") || lower.contains("timed out") {
+    if lower.contains("voice_policy_error")
+        || lower.contains("forwarded_voice_blocked")
+        || lower.contains("forwarded_bot_voice_blocked")
+    {
+        format!(
+            "voice_policy_error: Forwarded voice notes are blocked by safety policy. Send a direct voice note or allow forwarded voice explicitly. cause={detail}"
+        )
+    } else if lower.contains("timeout") || lower.contains("timed out") {
         format!(
             "mcp_transport_error: Mentor MCP transport timeout. Text fallback is active. cause={detail}"
         )

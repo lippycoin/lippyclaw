@@ -367,6 +367,8 @@ const stripMinimaxToolCalls = (input) => {
   return input
     .replace(/<minimax:tool_call\b[^>]*>[\s\S]*?<\/minimax:tool_call>/gi, "")
     .replace(/<minimax:toolcall\b[^>]*>[\s\S]*?<\/minimax:toolcall>/gi, "")
+    .replace(/<invoke\b[^>]*>[\s\S]*?<\/invoke>/gi, "")
+    .replace(/<parameter\b[^>]*>[\s\S]*?<\/parameter>/gi, "")
     .replace(/<think\b[^>]*>[\s\S]*?<\/think>/gi, "")
     .replace(/<thinking\b[^>]*>[\s\S]*?<\/thinking>/gi, "")
     .trim();
@@ -374,14 +376,28 @@ const stripMinimaxToolCalls = (input) => {
 
 const normalizeMentorReply = (raw) => {
   const cleaned = stripMinimaxToolCalls(raw.trim());
-  if (cleaned) {
-    return cleaned;
+  if (!cleaned) {
+    return "I hit a formatting issue. Please retry.";
   }
 
-  return "I hit a formatting issue. Please retry.";
+  const lower = cleaned.toLowerCase();
+  if (
+    lower.includes("cli-mcp-serverruncommand")
+    || lower.includes("<invoke")
+    || lower.includes("</invoke>")
+    || lower.includes("runcommand")
+  ) {
+    return "Read-only mentor mode: I can analyze and advise, but I cannot run commands or modify files.";
+  }
+
+  return cleaned;
 };
 
 const speechFallbackText = "Keep risk tight, take profit, and stay disciplined.";
+const mentorReadOnlyPolicy =
+  "Read-only mentor policy: you provide analysis and recommendations only. " +
+  "You cannot execute commands, access shells, edit files, trigger deploys, or claim you performed actions. " +
+  "If asked to perform actions, state that you are read-only and provide exact next steps for the operator.";
 
 const toSpeakableText = (input) => {
   if (typeof input !== "string") {
@@ -1081,6 +1097,10 @@ const handleMentorChat = async (args) => {
       role: "system",
       content: persona,
     },
+    {
+      role: "system",
+      content: mentorReadOnlyPolicy,
+    },
     ...(voiceModeInstruction
       ? [
           {
@@ -1153,6 +1173,10 @@ const handleMentorStatus = async () => {
 
   return {
     mentor: mentorName,
+    safety: {
+      sandboxAccess: "read_only",
+      actionExecution: false,
+    },
     llm: {
       baseUrl: llmBaseUrl,
       model: llmModel,

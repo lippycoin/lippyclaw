@@ -90,6 +90,30 @@ struct TelegramMessage {
 
     /// Bot command entities (for /commands).
     entities: Option<Vec<MessageEntity>>,
+
+    /// Legacy forwarded sender user.
+    #[serde(default)]
+    forward_from: Option<TelegramUser>,
+
+    /// Legacy forwarded sender display name.
+    #[serde(default)]
+    forward_sender_name: Option<String>,
+
+    /// Legacy forwarded sender chat.
+    #[serde(default)]
+    forward_from_chat: Option<TelegramChat>,
+
+    /// Legacy forwarded timestamp marker.
+    #[serde(default)]
+    forward_date: Option<i64>,
+
+    /// Automatic forward marker.
+    #[serde(default)]
+    is_automatic_forward: Option<bool>,
+
+    /// Newer forward metadata object.
+    #[serde(default)]
+    forward_origin: Option<serde_json::Value>,
 }
 
 /// Telegram User object.
@@ -217,6 +241,10 @@ const BOT_USERNAME_PATH: &str = "state/bot_username";
 
 /// Workspace path for persisting respond_to_all_group_messages flag.
 const RESPOND_TO_ALL_GROUP_PATH: &str = "state/respond_to_all_group_messages";
+/// Workspace path for blocking forwarded voice notes by default.
+const REJECT_FORWARDED_VOICE_PATH: &str = "state/reject_forwarded_voice_notes";
+/// Workspace path for blocking forwarded bot-origin voice notes.
+const REJECT_FORWARDED_BOT_VOICE_PATH: &str = "state/reject_forwarded_bot_voice_notes";
 
 /// Workspace key prefix for per-chat mentor voice mode state.
 const MENTOR_VOICE_MODE_PREFIX: &str = "state/mentor_voice_mode_";
@@ -284,6 +312,14 @@ struct TelegramConfig {
     #[serde(default)]
     respond_to_all_group_messages: bool,
 
+    /// Block forwarded voice/audio notes by default.
+    #[serde(default = "default_true")]
+    reject_forwarded_voice_notes: bool,
+
+    /// When forwarded voice is allowed, still block forwarded bot-origin clips.
+    #[serde(default = "default_true")]
+    reject_forwarded_bot_voice_notes: bool,
+
     /// Public tunnel URL for webhook mode (injected by host from global settings).
     /// When set, webhook mode is enabled and polling is disabled.
     #[serde(default)]
@@ -293,6 +329,10 @@ struct TelegramConfig {
     /// Telegram will include this in the X-Telegram-Bot-Api-Secret-Token header.
     #[serde(default)]
     webhook_secret: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // ============================================================================
@@ -379,9 +419,65 @@ fn write_mentor_voice_mode(chat_id: i64, enabled: bool) {
     if let Err(err) = channel_host::workspace_write(&path, value) {
         channel_host::log(
             channel_host::LogLevel::Error,
-            &format!("Failed to persist mentor voice mode for chat {}: {}", chat_id, err),
+            &format!(
+                "Failed to persist mentor voice mode for chat {}: {}",
+                chat_id, err
+            ),
         );
     }
+}
+
+fn read_workspace_bool(path: &str, default: bool) -> bool {
+    channel_host::workspace_read(path)
+        .map(|value| value.eq_ignore_ascii_case("on") || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(default)
+}
+
+fn is_forwarded_message(message: &TelegramMessage) -> bool {
+    message.forward_from.is_some()
+        || message.forward_sender_name.is_some()
+        || message.forward_from_chat.is_some()
+        || message.forward_date.is_some()
+        || message.is_automatic_forward.unwrap_or(false)
+        || message.forward_origin.is_some()
+}
+
+fn is_forwarded_from_bot(message: &TelegramMessage) -> bool {
+    if message
+        .forward_from
+        .as_ref()
+        .map(|user| user.is_bot)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    if let Some(origin) = message.forward_origin.as_ref() {
+        let sender_user_is_bot = origin
+            .get("sender_user")
+            .and_then(|value| value.get("is_bot"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        if sender_user_is_bot {
+            return true;
+        }
+
+        let sender_chat_present = origin.get("sender_chat").is_some();
+        let origin_type_is_channel = origin
+            .get("type")
+            .and_then(|value| value.as_str())
+            .map(|value| value.eq_ignore_ascii_case("channel"))
+            .unwrap_or(false);
+        if sender_chat_present || origin_type_is_channel {
+            return true;
+        }
+    }
+
+    message
+        .forward_from_chat
+        .as_ref()
+        .map(|chat| chat.chat_type.eq_ignore_ascii_case("channel"))
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -404,7 +500,11 @@ fn parse_mentor_voice_toggle(text: &str) -> Option<MentorVoiceToggle> {
         return None;
     }
 
-    match parts.next().map(|value| value.to_ascii_lowercase()).as_deref() {
+    match parts
+        .next()
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
         None => Some(MentorVoiceToggle::On),
         Some("on") => Some(MentorVoiceToggle::On),
         Some("off") => Some(MentorVoiceToggle::Off),
@@ -541,6 +641,14 @@ impl Guest for TelegramChannel {
             RESPOND_TO_ALL_GROUP_PATH,
             &config.respond_to_all_group_messages.to_string(),
         );
+        let _ = channel_host::workspace_write(
+            REJECT_FORWARDED_VOICE_PATH,
+            &config.reject_forwarded_voice_notes.to_string(),
+        );
+        let _ = channel_host::workspace_write(
+            REJECT_FORWARDED_BOT_VOICE_PATH,
+            &config.reject_forwarded_bot_voice_notes.to_string(),
+        );
 
         // Mode is determined by whether the host injected a tunnel_url
         // If tunnel is configured, use webhooks. Otherwise, use polling.
@@ -576,8 +684,7 @@ impl Guest for TelegramChannel {
 
             // Delete any existing webhook before polling. Telegram returns success
             // when no webhook exists, so any error here (e.g. 401) means a bad token.
-            delete_webhook()
-                .map_err(|e| format!("Bot token validation failed: {}", e))?;
+            delete_webhook().map_err(|e| format!("Bot token validation failed: {}", e))?;
         }
 
         // Configure polling only if not in webhook mode
@@ -784,7 +891,12 @@ impl Guest for TelegramChannel {
         if !response.content.trim().is_empty() {
             // Send plain text by default; Telegram Markdown parsing can break on
             // command-like strings (e.g. /mentor_voice with underscores).
-            let result = send_message(metadata.chat_id, &response.content, Some(metadata.message_id), None);
+            let result = send_message(
+                metadata.chat_id,
+                &response.content,
+                Some(metadata.message_id),
+                None,
+            );
 
             match result {
                 Ok(msg_id) => {
@@ -805,7 +917,9 @@ impl Guest for TelegramChannel {
                         ),
                     );
                     let msg_id = send_message(metadata.chat_id, &response.content, None, None)
-                        .map_err(|e| format!("Plain-text retry without reply context failed: {}", e))?;
+                        .map_err(|e| {
+                            format!("Plain-text retry without reply context failed: {}", e)
+                        })?;
 
                     channel_host::log(
                         channel_host::LogLevel::Debug,
@@ -1138,7 +1252,10 @@ fn telegram_get_file(file_id: &str) -> Result<TelegramFile, String> {
 
     if response.status != 200 {
         let body_str = String::from_utf8_lossy(&response.body);
-        return Err(format!("getFile failed ({}): {}", response.status, body_str));
+        return Err(format!(
+            "getFile failed ({}): {}",
+            response.status, body_str
+        ));
     }
 
     let api: TelegramApiResponse<TelegramFile> =
@@ -1221,8 +1338,8 @@ fn transcribe_with_mentor_mcp(audio: &[u8], mime_type: Option<&str>) -> Result<S
         .and_then(|value| value.as_str())
         .ok_or_else(|| "mentor.transcribe returned no text payload".to_string())?;
 
-    let parsed_payload: serde_json::Value =
-        serde_json::from_str(content_text).map_err(|err| format!("Invalid mentor payload: {}", err))?;
+    let parsed_payload: serde_json::Value = serde_json::from_str(content_text)
+        .map_err(|err| format!("Invalid mentor payload: {}", err))?;
     parsed_payload
         .get("text")
         .and_then(|value| value.as_str())
@@ -1366,7 +1483,10 @@ fn register_webhook(tunnel_url: &str, webhook_secret: Option<&str>) -> Result<()
     let context = if retried { " (after retry)" } else { "" };
     channel_host::log(
         channel_host::LogLevel::Info,
-        &format!("Webhook registered successfully{}: {}", context, webhook_url),
+        &format!(
+            "Webhook registered successfully{}: {}",
+            context, webhook_url
+        ),
     );
 
     Ok(())
@@ -1414,7 +1534,12 @@ fn handle_message(message: TelegramMessage) {
         .text
         .as_deref()
         .filter(|text| !text.is_empty())
-        .or_else(|| message.caption.as_deref().filter(|caption| !caption.is_empty()));
+        .or_else(|| {
+            message
+                .caption
+                .as_deref()
+                .filter(|caption| !caption.is_empty())
+        });
     let has_voice_payload = message.voice.is_some() || message.audio.is_some();
 
     if message_text.is_none() && !has_voice_payload {
@@ -1586,63 +1711,80 @@ fn handle_message(message: TelegramMessage) {
     };
 
     if content_to_emit.is_none() && has_voice_payload && mentor_voice_mode {
-        let (file_id, declared_size, mime_type) = if let Some(voice) = message.voice.as_ref() {
-            (
-                voice.file_id.as_str(),
-                voice.file_size,
-                voice.mime_type.as_deref().or(Some("audio/ogg")),
-            )
-        } else if let Some(audio) = message.audio.as_ref() {
-            (
-                audio.file_id.as_str(),
-                audio.file_size,
-                audio.mime_type.as_deref().or(Some("audio/mpeg")),
-            )
+        let reject_forwarded_voice = read_workspace_bool(REJECT_FORWARDED_VOICE_PATH, true);
+        let reject_forwarded_bot_voice = read_workspace_bool(REJECT_FORWARDED_BOT_VOICE_PATH, true);
+        let forwarded = is_forwarded_message(&message);
+        let forwarded_bot_origin = is_forwarded_from_bot(&message);
+
+        if forwarded && reject_forwarded_voice {
+            mentor_voice_transcription_error = Some(
+                "voice_policy_error: forwarded_voice_blocked: Forwarded voice notes are disabled by default for safety. Send a direct voice note instead.".to_string(),
+            );
+            content_to_emit = Some("/mentor_voice".to_string());
+        } else if forwarded && reject_forwarded_bot_voice && forwarded_bot_origin {
+            mentor_voice_transcription_error = Some(
+                "voice_policy_error: forwarded_bot_voice_blocked: Forwarded bot-origin voice notes are blocked by safety policy.".to_string(),
+            );
+            content_to_emit = Some("/mentor_voice".to_string());
         } else {
-            ("", None, None)
-        };
+            let (file_id, declared_size, mime_type) = if let Some(voice) = message.voice.as_ref() {
+                (
+                    voice.file_id.as_str(),
+                    voice.file_size,
+                    voice.mime_type.as_deref().or(Some("audio/ogg")),
+                )
+            } else if let Some(audio) = message.audio.as_ref() {
+                (
+                    audio.file_id.as_str(),
+                    audio.file_size,
+                    audio.mime_type.as_deref().or(Some("audio/mpeg")),
+                )
+            } else {
+                ("", None, None)
+            };
 
-        if !file_id.is_empty() {
-            let stt_result = (|| -> Result<String, String> {
-                if let Some(size) = declared_size {
-                    if size > MAX_VOICE_BYTES {
+            if !file_id.is_empty() {
+                let stt_result = (|| -> Result<String, String> {
+                    if let Some(size) = declared_size {
+                        if size > MAX_VOICE_BYTES {
+                            return Err(format!(
+                                "Voice note too large ({} bytes > {} bytes)",
+                                size, MAX_VOICE_BYTES
+                            ));
+                        }
+                    }
+
+                    let file = telegram_get_file(file_id)?;
+                    if let Some(size) = file.file_size {
+                        if size > MAX_VOICE_BYTES {
+                            return Err(format!(
+                                "Voice note too large ({} bytes > {} bytes)",
+                                size, MAX_VOICE_BYTES
+                            ));
+                        }
+                    }
+
+                    let bytes = download_telegram_file(&file.file_path)?;
+                    if bytes.len() as u64 > MAX_VOICE_BYTES {
                         return Err(format!(
                             "Voice note too large ({} bytes > {} bytes)",
-                            size, MAX_VOICE_BYTES
+                            bytes.len(),
+                            MAX_VOICE_BYTES
                         ));
                     }
-                }
 
-                let file = telegram_get_file(file_id)?;
-                if let Some(size) = file.file_size {
-                    if size > MAX_VOICE_BYTES {
-                        return Err(format!(
-                            "Voice note too large ({} bytes > {} bytes)",
-                            size, MAX_VOICE_BYTES
-                        ));
+                    transcribe_with_mentor_mcp(&bytes, mime_type)
+                })();
+
+                match stt_result {
+                    Ok(transcript) => {
+                        mentor_voice_transcript = Some(transcript.clone());
+                        content_to_emit = Some(format!("/mentor_voice {}", transcript));
                     }
-                }
-
-                let bytes = download_telegram_file(&file.file_path)?;
-                if bytes.len() as u64 > MAX_VOICE_BYTES {
-                    return Err(format!(
-                        "Voice note too large ({} bytes > {} bytes)",
-                        bytes.len(),
-                        MAX_VOICE_BYTES
-                    ));
-                }
-
-                transcribe_with_mentor_mcp(&bytes, mime_type)
-            })();
-
-            match stt_result {
-                Ok(transcript) => {
-                    mentor_voice_transcript = Some(transcript.clone());
-                    content_to_emit = Some(format!("/mentor_voice {}", transcript));
-                }
-                Err(err) => {
-                    mentor_voice_transcription_error = Some(err.clone());
-                    content_to_emit = Some("/mentor_voice".to_string());
+                    Err(err) => {
+                        mentor_voice_transcription_error = Some(err.clone());
+                        content_to_emit = Some("/mentor_voice".to_string());
+                    }
                 }
             }
         }
@@ -1845,7 +1987,10 @@ mod tests {
         assert_eq!(clean_message_text("/undo", None), "/undo");
         assert_eq!(clean_message_text("/ping", None), "/ping");
         assert_eq!(clean_message_text("/start hello", None), "/start hello");
-        assert_eq!(clean_message_text("/help me please", None), "/help me please");
+        assert_eq!(
+            clean_message_text("/help me please", None),
+            "/help me please"
+        );
     }
 
     #[test]
@@ -2002,6 +2147,8 @@ mod tests {
         let json = r#"{"owner_id": 123456789}"#;
         let config: TelegramConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.owner_id, Some(123456789));
+        assert!(config.reject_forwarded_voice_notes);
+        assert!(config.reject_forwarded_bot_voice_notes);
     }
 
     #[test]
@@ -2023,12 +2170,32 @@ mod tests {
         let json = r#"{
             "bot_username": "my_bot",
             "owner_id": 42,
-            "respond_to_all_group_messages": true
+            "respond_to_all_group_messages": true,
+            "reject_forwarded_voice_notes": false,
+            "reject_forwarded_bot_voice_notes": false
         }"#;
         let config: TelegramConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.bot_username, Some("my_bot".to_string()));
         assert_eq!(config.owner_id, Some(42));
         assert!(config.respond_to_all_group_messages);
+        assert!(!config.reject_forwarded_voice_notes);
+        assert!(!config.reject_forwarded_bot_voice_notes);
+    }
+
+    #[test]
+    fn test_forwarded_detection_helpers() {
+        let msg: TelegramMessage = serde_json::from_str(
+            r#"{
+                "message_id": 1,
+                "from": { "id": 42, "is_bot": false, "first_name": "Tom" },
+                "chat": { "id": 42, "type": "private" },
+                "voice": { "file_id": "abc" },
+                "forward_from": { "id": 99, "is_bot": true, "first_name": "Bot" }
+            }"#,
+        )
+        .unwrap();
+        assert!(is_forwarded_message(&msg));
+        assert!(is_forwarded_from_bot(&msg));
     }
 
     #[test]

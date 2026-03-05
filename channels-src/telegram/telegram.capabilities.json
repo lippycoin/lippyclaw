@@ -48,6 +48,8 @@
     "bot_username": null,
     "owner_id": null,
     "respond_to_all_group_messages": false,
+    "reject_forwarded_voice_notes": true,
+    "reject_forwarded_bot_voice_notes": true,
     "polling_enabled": false,
     "poll_interval_ms": 30000,
     "dm_policy": "pairing",
