@@ -248,6 +248,26 @@ const findStringByCandidates = (node, candidates) => {
 const extractTextFromPayload = (payload) =>
   findStringByCandidates(payload, ["text", "transcript", "output_text", "content"]);
 
+const stripMinimaxToolCalls = (input) => {
+  if (typeof input !== "string" || !input) {
+    return "";
+  }
+
+  return input
+    .replace(/<minimax:tool_call\b[^>]*>[\s\S]*?<\/minimax:tool_call>/gi, "")
+    .replace(/<minimax:toolcall\b[^>]*>[\s\S]*?<\/minimax:toolcall>/gi, "")
+    .trim();
+};
+
+const normalizeMentorReply = (raw) => {
+  const cleaned = stripMinimaxToolCalls(raw.trim());
+  if (cleaned) {
+    return cleaned;
+  }
+
+  return "I hit a formatting issue. Please retry.";
+};
+
 const extractAudioBufferFromPayload = async (payload) => {
   const audioBase64 = findStringByCandidates(payload, [
     "audio_base64",
@@ -307,7 +327,7 @@ const callMentorLlm = async (messages) => {
   const content = message?.content;
 
   if (typeof content === "string") {
-    return content.trim();
+    return normalizeMentorReply(content);
   }
 
   if (Array.isArray(content)) {
@@ -316,10 +336,10 @@ const callMentorLlm = async (messages) => {
       .map((part) => part.text)
       .join("\n")
       .trim();
-    return text;
+    return normalizeMentorReply(text);
   }
 
-  return "";
+  return normalizeMentorReply("");
 };
 
 const callChutesRunModel = async (model, input) => {
