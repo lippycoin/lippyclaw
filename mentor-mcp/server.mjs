@@ -218,6 +218,45 @@ const parseNumberWithFallback = (rawValue, fallbackValue) => {
   return fallbackValue;
 };
 
+const llmRequestTimeoutMs = Math.max(
+  5000,
+  parseNumberWithFallback(process.env.MENTOR_LLM_REQUEST_TIMEOUT_MS, 45000),
+);
+const llmMaxRetries = Math.max(
+  0,
+  parseNumberWithFallback(process.env.MENTOR_LLM_MAX_RETRIES, 2),
+);
+const llmRetryBackoffMs = Math.max(
+  100,
+  parseNumberWithFallback(process.env.MENTOR_LLM_RETRY_BACKOFF_MS, 1500),
+);
+const voiceRequestTimeoutMs = Math.max(
+  5000,
+  parseNumberWithFallback(process.env.MENTOR_VOICE_REQUEST_TIMEOUT_MS, 120000),
+);
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const isRetryableHttpStatus = (status) => status === 429 || status >= 500;
+
+const isRetryableFetchError = (error) => {
+  const message = `${error?.message || ""}`.toLowerCase();
+  return (
+    error?.name === "AbortError" ||
+    message.includes("fetch failed") ||
+    message.includes("timeout") ||
+    message.includes("eai_again") ||
+    message.includes("enotfound") ||
+    message.includes("econnreset")
+  );
+};
+
+const fetchWithTimeout = (url, options, timeoutMs) =>
+  fetch(url, {
+    ...options,
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+
 const resolveVoiceProvider = () => {
   if (mentorVoiceProvider === "fish" || mentorVoiceProvider === "chutes") {
     return mentorVoiceProvider;
@@ -354,11 +393,11 @@ const extractAudioBufferFromPayload = async (payload) => {
 
   const audioUrl = findStringByCandidates(payload, ["audio_url", "url"]);
   if (audioUrl && audioUrl.startsWith("http")) {
-    const response = await fetch(audioUrl, {
+    const response = await fetchWithTimeout(audioUrl, {
       headers: {
         authorization: `Bearer ${mentorVoiceApiKey}`,
       },
-    });
+    }, voiceRequestTimeoutMs);
 
     if (!response.ok) {
       throw new Error(`Failed to fetch synthesized audio URL (${response.status}).`);
@@ -375,26 +414,65 @@ const callMentorLlm = async (messages) => {
     throw new Error("MENTOR_LLM_API_KEY/SUB_LLM_API_KEY/MAIN_LLM_API_KEY is not configured.");
   }
 
-  const response = await fetch(`${llmBaseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${llmApiKey}`,
-    },
-    body: JSON.stringify({
-      model: llmModel,
-      temperature: 0.2,
-      max_tokens: 900,
-      messages,
-    }),
+  const requestBody = JSON.stringify({
+    model: llmModel,
+    temperature: 0.2,
+    max_tokens: 900,
+    messages,
   });
 
-  if (!response.ok) {
-    const errorBody = await response.text();
-    throw new Error(`Mentor LLM request failed (${response.status}): ${errorBody.slice(0, 300)}`);
+  let data;
+  let lastError;
+  for (let attempt = 0; attempt <= llmMaxRetries; attempt += 1) {
+    try {
+      const response = await fetchWithTimeout(
+        `${llmBaseUrl}/chat/completions`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${llmApiKey}`,
+          },
+          body: requestBody,
+        },
+        llmRequestTimeoutMs,
+      );
+
+      if (!response.ok) {
+        const errorBody = await response.text();
+        const message =
+          `Mentor LLM request failed (${response.status})` +
+          ` attempt=${attempt + 1}/${llmMaxRetries + 1}: ${errorBody.slice(0, 300)}`;
+
+        if (attempt < llmMaxRetries && isRetryableHttpStatus(response.status)) {
+          lastError = new Error(message);
+          const backoff = llmRetryBackoffMs * (attempt + 1);
+          await sleep(backoff);
+          continue;
+        }
+
+        throw new Error(message);
+      }
+
+      data = await response.json();
+      break;
+    } catch (error) {
+      if (attempt < llmMaxRetries && isRetryableFetchError(error)) {
+        lastError = error;
+        const backoff = llmRetryBackoffMs * (attempt + 1);
+        await sleep(backoff);
+        continue;
+      }
+      throw error;
+    }
   }
 
-  const data = await response.json();
+  if (!data) {
+    throw new Error(
+      `Mentor LLM request failed after retries: ${lastError?.message || "unknown error"}`,
+    );
+  }
+
   const message = data?.choices?.[0]?.message;
   const content = message?.content;
 
@@ -415,7 +493,7 @@ const callMentorLlm = async (messages) => {
 };
 
 const callChutesRunModel = async (model, input) => {
-  const response = await fetch(mentorVoiceRunEndpoint, {
+  const response = await fetchWithTimeout(mentorVoiceRunEndpoint, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -425,7 +503,7 @@ const callChutesRunModel = async (model, input) => {
       model,
       input,
     }),
-  });
+  }, voiceRequestTimeoutMs);
 
   if (!response.ok) {
     const errorBody = await response.text();
@@ -436,14 +514,14 @@ const callChutesRunModel = async (model, input) => {
 };
 
 const callChutesDirectJson = async (endpoint, payload, label) => {
-  const response = await fetch(endpoint, {
+  const response = await fetchWithTimeout(endpoint, {
     method: "POST",
     headers: {
       "content-type": "application/json",
       authorization: `Bearer ${mentorVoiceApiKey}`,
     },
     body: JSON.stringify(payload),
-  });
+  }, voiceRequestTimeoutMs);
 
   if (!response.ok) {
     const errorBody = await response.text();
@@ -454,14 +532,14 @@ const callChutesDirectJson = async (endpoint, payload, label) => {
 };
 
 const callChutesDirectAudio = async (endpoint, payload, label) => {
-  const response = await fetch(endpoint, {
+  const response = await fetchWithTimeout(endpoint, {
     method: "POST",
     headers: {
       "content-type": "application/json",
       authorization: `Bearer ${mentorVoiceApiKey}`,
     },
     body: JSON.stringify(payload),
-  });
+  }, voiceRequestTimeoutMs);
 
   if (!response.ok) {
     const errorBody = await response.text();
@@ -492,13 +570,13 @@ const transcribeBufferFish = async (audioBuffer, mimeType, language) => {
     form.append("language", language.trim());
   }
 
-  const response = await fetch(mentorFishAsrEndpoint, {
+  const response = await fetchWithTimeout(mentorFishAsrEndpoint, {
     method: "POST",
     headers: {
       authorization: `Bearer ${mentorFishApiKey}`,
     },
     body: form,
-  });
+  }, voiceRequestTimeoutMs);
 
   if (!response.ok) {
     const errorBody = await response.text();
@@ -535,7 +613,7 @@ const synthesizeWithFish = async (text) => {
     payload.reference_id = referenceId;
   }
 
-  const response = await fetch(mentorFishTtsEndpoint, {
+  const response = await fetchWithTimeout(mentorFishTtsEndpoint, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -543,7 +621,7 @@ const synthesizeWithFish = async (text) => {
       model: mentorFishModel,
     },
     body: JSON.stringify(payload),
-  });
+  }, voiceRequestTimeoutMs);
 
   if (!response.ok) {
     const errorBody = await response.text();
@@ -566,13 +644,13 @@ const transcribeBufferOpenAICompatible = async (audioBuffer, mimeType) => {
   form.append("file", blob, `audio.${ext}`);
   form.append("model", mentorWhisperModel);
 
-  const response = await fetch(`${mentorVoiceBaseUrl}/audio/transcriptions`, {
+  const response = await fetchWithTimeout(`${mentorVoiceBaseUrl}/audio/transcriptions`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${mentorVoiceApiKey}`,
     },
     body: form,
-  });
+  }, voiceRequestTimeoutMs);
 
   if (!response.ok) {
     const errorBody = await response.text();
@@ -666,14 +744,14 @@ const synthesizeWithOpenAICompatibleSpeech = async (model, text, contextText, sa
     context_audio_base64: sampleAudioBase64,
   };
 
-  const response = await fetch(`${mentorVoiceBaseUrl}/audio/speech`, {
+  const response = await fetchWithTimeout(`${mentorVoiceBaseUrl}/audio/speech`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
       authorization: `Bearer ${mentorVoiceApiKey}`,
     },
     body: JSON.stringify(body),
-  });
+  }, voiceRequestTimeoutMs);
 
   if (!response.ok) {
     const errorBody = await response.text();
