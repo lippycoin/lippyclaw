@@ -33,6 +33,7 @@ const llmModel =
   "MiniMaxAI/MiniMax-M2.5-TEE";
 
 const mentorVoiceEnabled = (process.env.ENABLE_MENTOR_VOICE || "false") === "true";
+const mentorVoiceProvider = (process.env.MENTOR_VOICE_PROVIDER || "auto").trim().toLowerCase();
 const mentorVoiceMode = (process.env.MENTOR_CHUTES_VOICE_MODE || "run_api").trim();
 const mentorVoiceBaseUrl = (
   process.env.MENTOR_VOICE_API_BASE_URL ||
@@ -65,6 +66,26 @@ const mentorVoiceContextPath =
   process.env.MENTOR_VOICE_CONTEXT_PATH || "/data/mentor/voice_context.txt";
 const mentorVoiceAutoTranscribe =
   (process.env.MENTOR_VOICE_AUTO_TRANSCRIBE || "true") === "true";
+const mentorFishApiBaseUrl = (
+  process.env.MENTOR_FISH_API_BASE_URL || "https://api.fish.audio"
+).replace(/\/$/, "");
+const mentorFishApiKey = process.env.MENTOR_FISH_API_KEY || "";
+const mentorFishTtsEndpoint =
+  process.env.MENTOR_FISH_TTS_ENDPOINT || `${mentorFishApiBaseUrl}/v1/tts`;
+const mentorFishAsrEndpoint =
+  process.env.MENTOR_FISH_ASR_ENDPOINT || `${mentorFishApiBaseUrl}/v1/asr`;
+const mentorFishModel = process.env.MENTOR_FISH_MODEL || "s1";
+const mentorFishReferenceId = process.env.MENTOR_FISH_REFERENCE_ID || "";
+const mentorFishFormat = (process.env.MENTOR_FISH_FORMAT || "mp3").toLowerCase();
+const mentorFishLatency = process.env.MENTOR_FISH_LATENCY || "normal";
+const mentorFishNormalize = (process.env.MENTOR_FISH_NORMALIZE || "true") === "true";
+const mentorFishIgnoreTimestamps =
+  (process.env.MENTOR_FISH_IGNORE_TIMESTAMPS || "true") === "true";
+const mentorFishTemperature = Number(process.env.MENTOR_FISH_TEMPERATURE || "0.7");
+const mentorFishTopP = Number(process.env.MENTOR_FISH_TOP_P || "0.7");
+const mentorFishRepetitionPenalty = Number(process.env.MENTOR_FISH_REPETITION_PENALTY || "1.2");
+const mentorFishMaxNewTokens = Number(process.env.MENTOR_FISH_MAX_NEW_TOKENS || "1024");
+const mentorFishChunkLength = Number(process.env.MENTOR_FISH_CHUNK_LENGTH || "240");
 
 const mentorArtifactDir = process.env.MENTOR_ARTIFACT_DIR || "/data/artifacts/mentor";
 
@@ -112,7 +133,7 @@ const tools = [
   {
     name: "mentor.speak",
     description:
-      "Convert text into mentor voice audio using Chutes voice cloning pipeline (Whisper + CSM + Kokoro fallback).",
+      "Convert text into mentor voice audio using the configured provider (Fish Audio or Chutes voice cloning pipeline).",
     inputSchema: {
       type: "object",
       properties: {
@@ -124,7 +145,7 @@ const tools = [
   },
   {
     name: "mentor.transcribe",
-    description: "Transcribe base64 audio to text using Chutes whisper model.",
+    description: "Transcribe base64 audio to text using the configured STT backend (Fish ASR or Chutes Whisper).",
     inputSchema: {
       type: "object",
       properties: {
@@ -189,6 +210,37 @@ const fileExists = async (filePath) => {
   }
 };
 
+const parseNumberWithFallback = (rawValue, fallbackValue) => {
+  const numeric = Number(rawValue);
+  if (Number.isFinite(numeric)) {
+    return numeric;
+  }
+  return fallbackValue;
+};
+
+const resolveVoiceProvider = () => {
+  if (mentorVoiceProvider === "fish" || mentorVoiceProvider === "chutes") {
+    return mentorVoiceProvider;
+  }
+
+  if (
+    mentorVoiceProvider === "openai_compatible" ||
+    mentorVoiceProvider === "run_api" ||
+    mentorVoiceProvider === "chutes_direct"
+  ) {
+    return "chutes";
+  }
+
+  // Auto mode: Fish takes priority when explicitly configured.
+  if (mentorFishApiKey.trim()) {
+    return "fish";
+  }
+
+  return "chutes";
+};
+
+const activeVoiceProvider = resolveVoiceProvider();
+
 const sampleMimeType = (samplePath) => {
   const ext = path.extname(samplePath).toLowerCase();
   if (ext === ".mp4" || ext === ".m4a") {
@@ -204,6 +256,26 @@ const sampleMimeType = (samplePath) => {
     return "audio/webm";
   }
   return "audio/mpeg";
+};
+
+const extensionForMimeType = (mimeType) => {
+  const normalized = (mimeType || "").toLowerCase();
+  if (normalized.includes("wav")) {
+    return "wav";
+  }
+  if (normalized.includes("ogg")) {
+    return "ogg";
+  }
+  if (normalized.includes("webm")) {
+    return "webm";
+  }
+  if (normalized.includes("mp4") || normalized.includes("m4a")) {
+    return "m4a";
+  }
+  if (normalized.includes("mpeg") || normalized.includes("mp3")) {
+    return "mp3";
+  }
+  return "ogg";
 };
 
 const stripDataUrl = (value) =>
@@ -405,6 +477,88 @@ const callChutesDirectAudio = async (endpoint, payload, label) => {
   return Buffer.from(await response.arrayBuffer());
 };
 
+const transcribeBufferFish = async (audioBuffer, mimeType, language) => {
+  if (!mentorFishApiKey) {
+    throw new Error("MENTOR_FISH_API_KEY is not configured.");
+  }
+
+  const normalizedMime = mimeType || "audio/ogg";
+  const extension = extensionForMimeType(normalizedMime);
+  const form = new FormData();
+  const blob = new Blob([audioBuffer], { type: normalizedMime });
+  form.append("audio", blob, `audio.${extension}`);
+  form.append("ignore_timestamps", mentorFishIgnoreTimestamps ? "true" : "false");
+  if (typeof language === "string" && language.trim()) {
+    form.append("language", language.trim());
+  }
+
+  const response = await fetch(mentorFishAsrEndpoint, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${mentorFishApiKey}`,
+    },
+    body: form,
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`Fish ASR failed (${response.status}): ${errorBody.slice(0, 300)}`);
+  }
+
+  const payload = await response.json();
+  const text = extractTextFromPayload(payload);
+  if (!text) {
+    throw new Error("Fish ASR response did not include transcript text.");
+  }
+  return text;
+};
+
+const synthesizeWithFish = async (text) => {
+  if (!mentorFishApiKey) {
+    throw new Error("MENTOR_FISH_API_KEY is not configured.");
+  }
+
+  const payload = {
+    text,
+    format: mentorFishFormat,
+    normalize: mentorFishNormalize,
+    latency: mentorFishLatency,
+    temperature: parseNumberWithFallback(mentorFishTemperature, 0.7),
+    top_p: parseNumberWithFallback(mentorFishTopP, 0.7),
+    repetition_penalty: parseNumberWithFallback(mentorFishRepetitionPenalty, 1.2),
+    max_new_tokens: parseNumberWithFallback(mentorFishMaxNewTokens, 1024),
+    chunk_length: parseNumberWithFallback(mentorFishChunkLength, 240),
+  };
+
+  const referenceId = mentorFishReferenceId.trim();
+  if (referenceId) {
+    payload.reference_id = referenceId;
+  }
+
+  const response = await fetch(mentorFishTtsEndpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${mentorFishApiKey}`,
+      model: mentorFishModel,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`Fish TTS failed (${response.status}): ${errorBody.slice(0, 300)}`);
+  }
+
+  const contentType = response.headers.get("content-type") || "";
+  if (contentType.includes("application/json")) {
+    const responsePayload = await response.json();
+    return extractAudioBufferFromPayload(responsePayload);
+  }
+
+  return Buffer.from(await response.arrayBuffer());
+};
+
 const transcribeBufferOpenAICompatible = async (audioBuffer, mimeType) => {
   const form = new FormData();
   const ext = mimeType.includes("mpeg") || mimeType.includes("mp3") ? "mp3" : "ogg";
@@ -435,6 +589,10 @@ const transcribeBufferOpenAICompatible = async (audioBuffer, mimeType) => {
 };
 
 const transcribeBuffer = async (audioBuffer, mimeType, language) => {
+  if (activeVoiceProvider === "fish") {
+    return transcribeBufferFish(audioBuffer, mimeType, language);
+  }
+
   if (!mentorVoiceApiKey) {
     throw new Error("MENTOR_VOICE_API_KEY/MAIN_LLM_API_KEY is not configured.");
   }
@@ -683,6 +841,32 @@ const bootstrapVoiceContext = async () => {
     throw new Error("Mentor voice is disabled (ENABLE_MENTOR_VOICE=false).");
   }
 
+  if (activeVoiceProvider === "fish") {
+    if (!mentorFishApiKey) {
+      throw new Error("MENTOR_FISH_API_KEY is missing.");
+    }
+
+    if (contextCache && contextCache.trim()) {
+      return contextCache;
+    }
+
+    if (await fileExists(mentorVoiceContextPath)) {
+      const existing = (await readFile(mentorVoiceContextPath, "utf8")).trim();
+      if (existing) {
+        contextCache = existing;
+        return existing;
+      }
+    }
+
+    const defaultFishContext = mentorFishReferenceId.trim()
+      ? `Fish voice reference active: ${mentorFishReferenceId.trim()}`
+      : "Fish voice provider active (no reference_id configured; using model default voice).";
+    await ensureDir(path.dirname(mentorVoiceContextPath));
+    await writeFile(mentorVoiceContextPath, defaultFishContext, "utf8");
+    contextCache = defaultFishContext;
+    return defaultFishContext;
+  }
+
   if (!mentorVoiceApiKey) {
     throw new Error("MENTOR_VOICE_API_KEY/MAIN_LLM_API_KEY is missing.");
   }
@@ -724,32 +908,40 @@ const synthesizeMentorSpeech = async (text) => {
     throw new Error("Mentor voice is disabled (ENABLE_MENTOR_VOICE=false).");
   }
 
-  if (!mentorVoiceApiKey) {
-    throw new Error("MENTOR_VOICE_API_KEY/MAIN_LLM_API_KEY is missing.");
-  }
-
-  if (!(await fileExists(mentorVoiceSamplePath))) {
-    throw new Error(`Mentor voice sample not found: ${mentorVoiceSamplePath}`);
-  }
-
-  const contextText = await bootstrapVoiceContext();
-  const sampleAudio = await readFile(mentorVoiceSamplePath);
-
   let audio;
   let backendUsed = "csm";
-  try {
-    audio = await synthesizeWithCloneModel(text, contextText, sampleAudio);
-  } catch (error) {
-    if (!mentorEnableKokoroFallback) {
-      throw error;
+  let outputExtension = "mp3";
+
+  if (activeVoiceProvider === "fish") {
+    await bootstrapVoiceContext();
+    audio = await synthesizeWithFish(text);
+    backendUsed = mentorFishReferenceId.trim() ? "fish_reference" : "fish";
+    outputExtension = mentorFishFormat || "mp3";
+  } else {
+    if (!mentorVoiceApiKey) {
+      throw new Error("MENTOR_VOICE_API_KEY/MAIN_LLM_API_KEY is missing.");
     }
 
-    backendUsed = "kokoro_fallback";
-    audio = await synthesizeWithKokoro(text);
+    if (!(await fileExists(mentorVoiceSamplePath))) {
+      throw new Error(`Mentor voice sample not found: ${mentorVoiceSamplePath}`);
+    }
+
+    const contextText = await bootstrapVoiceContext();
+    const sampleAudio = await readFile(mentorVoiceSamplePath);
+    try {
+      audio = await synthesizeWithCloneModel(text, contextText, sampleAudio);
+    } catch (error) {
+      if (!mentorEnableKokoroFallback) {
+        throw error;
+      }
+
+      backendUsed = "kokoro_fallback";
+      audio = await synthesizeWithKokoro(text);
+    }
   }
 
   await ensureDir(mentorArtifactDir);
-  const fileName = `mentor-${Date.now()}-${randomUUID()}.mp3`;
+  const fileName = `mentor-${Date.now()}-${randomUUID()}.${outputExtension}`;
   const outputPath = path.join(mentorArtifactDir, fileName);
   await writeFile(outputPath, audio);
 
@@ -772,12 +964,23 @@ const handleMentorChat = async (args) => {
   const sessionId = parsed.sessionId || "default";
   const persona = await loadPersona();
   const history = await getSessionHistory(sessionId);
+  const voiceModeInstruction = parsed.voiceReply
+    ? "Voice mode policy: reply in 1-3 short sentences (max ~45 words), witty and practical, no rambling, no markup wrappers."
+    : "";
 
   const messages = [
     {
       role: "system",
       content: persona,
     },
+    ...(voiceModeInstruction
+      ? [
+          {
+            role: "system",
+            content: voiceModeInstruction,
+          },
+        ]
+      : []),
     ...history.map((turn) => ({ role: turn.role, content: turn.content })),
     {
       role: "user",
@@ -834,7 +1037,10 @@ const handleMentorVoiceBootstrap = async () => {
 const handleMentorStatus = async () => {
   const persona = await loadPersona();
   const contextReady = await fileExists(mentorVoiceContextPath);
-  const sampleReady = await fileExists(mentorVoiceSamplePath);
+  const sampleFileReady = await fileExists(mentorVoiceSamplePath);
+  const fishReferenceConfigured = mentorFishReferenceId.trim().length > 0;
+  const sampleReady =
+    activeVoiceProvider === "fish" ? fishReferenceConfigured || sampleFileReady : sampleFileReady;
 
   return {
     mentor: mentorName,
@@ -845,13 +1051,17 @@ const handleMentorStatus = async () => {
     },
     voice: {
       enabled: mentorVoiceEnabled,
+      provider: activeVoiceProvider,
       mode: mentorVoiceMode,
       apiBaseUrl: mentorVoiceBaseUrl,
       runEndpoint: mentorVoiceRunEndpoint,
       whisperEndpoint: mentorWhisperEndpoint,
       csmEndpoint: mentorCsmEndpoint,
       kokoroEndpoint: mentorKokoroEndpoint,
-      apiKeyConfigured: mentorVoiceApiKey.length > 0,
+      apiKeyConfigured:
+        activeVoiceProvider === "fish"
+          ? mentorFishApiKey.length > 0
+          : mentorVoiceApiKey.length > 0,
       whisperModel: mentorWhisperModel,
       cloneModel: mentorCloneModel,
       kokoroModel: mentorKokoroModel,
@@ -860,6 +1070,15 @@ const handleMentorStatus = async () => {
       contextPath: mentorVoiceContextPath,
       sampleReady,
       contextReady,
+      fish: {
+        apiBaseUrl: mentorFishApiBaseUrl,
+        ttsEndpoint: mentorFishTtsEndpoint,
+        asrEndpoint: mentorFishAsrEndpoint,
+        model: mentorFishModel,
+        apiKeyConfigured: mentorFishApiKey.length > 0,
+        referenceConfigured: fishReferenceConfigured,
+        format: mentorFishFormat,
+      },
     },
     memory: {
       file: mentorMemoryFile,
@@ -879,6 +1098,7 @@ app.get("/healthz", async () => {
     mentor: mentorName,
     llmModel,
     voiceEnabled: mentorVoiceEnabled,
+    voiceProvider: activeVoiceProvider,
     voiceMode: mentorVoiceMode,
     sampleReady,
     contextReady,
@@ -989,10 +1209,13 @@ app.listen({ host: "0.0.0.0", port }).then(() => {
       llmBaseUrl,
       llmModel,
       mentorVoiceEnabled,
+      mentorVoiceProvider: activeVoiceProvider,
       mentorVoiceMode,
       mentorWhisperModel,
       mentorCloneModel,
       mentorKokoroModel,
+      mentorFishModel,
+      mentorFishReferenceConfigured: mentorFishReferenceId.trim().length > 0,
     },
     "mentor-mcp started",
   );

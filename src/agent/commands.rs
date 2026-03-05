@@ -60,12 +60,18 @@ fn mentor_error_summary(error: &str) -> String {
         format!(
             "mcp_schema_error: Mentor tool schema error. Check mentor MCP argument contract. cause={detail}"
         )
-    } else if lower.contains("transcribe") || lower.contains("whisper") {
+    } else if lower.contains("transcribe")
+        || lower.contains("whisper")
+        || lower.contains("asr")
+        || lower.contains("stt")
+    {
         format!(
             "stt_backend_error: Voice STT backend error while processing the voice note. cause={detail}"
         )
     } else if lower.contains("speak")
         || lower.contains("voice")
+        || lower.contains("tts")
+        || lower.contains("fish")
         || lower.contains("kokoro")
         || lower.contains("csm")
     {
@@ -241,11 +247,35 @@ fn strip_minimax_tool_calls(input: &str) -> String {
 
 fn enforce_voice_reply_style(reply: &str) -> String {
     let trimmed = reply.trim();
-    if trimmed.chars().count() <= 260 {
-        return trimmed.to_string();
+    if trimmed.is_empty() {
+        return String::new();
     }
-    let clipped: String = trimmed.chars().take(257).collect();
-    format!("{clipped}...")
+
+    let mut sentence_count = 0usize;
+    let mut limited = String::new();
+    for ch in trimmed.chars() {
+        limited.push(ch);
+        if matches!(ch, '.' | '!' | '?') {
+            sentence_count += 1;
+            if sentence_count >= 3 {
+                break;
+            }
+        }
+        if limited.chars().count() >= 260 {
+            break;
+        }
+    }
+
+    if limited.trim().is_empty() {
+        return trimmed.chars().take(260).collect();
+    }
+
+    if trimmed.chars().count() > limited.chars().count() {
+        let clipped: String = limited.chars().take(257).collect();
+        return format!("{clipped}...");
+    }
+
+    limited.trim().to_string()
 }
 
 fn audio_mime_type_for_path(path: &str) -> &'static str {
@@ -1193,6 +1223,11 @@ impl Agent {
                     .and_then(|value| value.get("enabled"))
                     .and_then(|value| value.as_bool())
                     .unwrap_or(false);
+                let voice_provider = status
+                    .get("voice")
+                    .and_then(|value| value.get("provider"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
                 let sample_ready = status
                     .get("voice")
                     .and_then(|value| value.get("sampleReady"))
@@ -1205,8 +1240,9 @@ impl Agent {
                     .unwrap_or(false);
 
                 Ok(SubmissionResult::response(format!(
-                    "{mentor_name} status\nvoice_mode={}\nllm_ready={}\nvoice_enabled={}\nsample_ready={}\ncontext_ready={}",
+                    "{mentor_name} status\nvoice_mode={}\nvoice_provider={}\nllm_ready={}\nvoice_enabled={}\nsample_ready={}\ncontext_ready={}",
                     if mentor_ctx.voice_mode { "on" } else { "off" },
+                    voice_provider,
                     llm_ready,
                     voice_enabled,
                     sample_ready,
