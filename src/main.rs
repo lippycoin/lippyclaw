@@ -982,7 +982,16 @@ async fn setup_wasm_channels(
             }
         });
 
-        let secret_header = loaded.webhook_secret_header().map(|s| s.to_string());
+        let secret_header = loaded
+            .webhook_secret_header()
+            .map(|s| s.to_string())
+            .or_else(|| {
+                if channel_name.eq_ignore_ascii_case("telegram") {
+                    Some("X-Telegram-Bot-Api-Secret-Token".to_string())
+                } else {
+                    None
+                }
+            });
 
         let webhook_path = format!("/webhook/{}", channel_name);
         let endpoints = vec![RegisteredEndpoint {

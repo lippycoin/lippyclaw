@@ -2362,7 +2362,16 @@ impl ExtensionManager {
 
         let channel_name = loaded.name().to_string();
         let webhook_secret_name = loaded.webhook_secret_name();
-        let secret_header = loaded.webhook_secret_header().map(|s| s.to_string());
+        let secret_header = loaded
+            .webhook_secret_header()
+            .map(|s| s.to_string())
+            .or_else(|| {
+                if channel_name.eq_ignore_ascii_case("telegram") {
+                    Some("X-Telegram-Bot-Api-Secret-Token".to_string())
+                } else {
+                    None
+                }
+            });
         let sig_key_secret_name = loaded.signature_key_secret_name();
 
         // Get webhook secret from secrets store
