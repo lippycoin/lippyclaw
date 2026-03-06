@@ -588,6 +588,42 @@ const findStringByCandidates = (node, candidates) => {
   return undefined;
 };
 
+const findStringArrayFirstByCandidates = (node, candidates) => {
+  if (!node || typeof node !== "object") {
+    return undefined;
+  }
+
+  for (const key of candidates) {
+    const value = node[key];
+    if (Array.isArray(value)) {
+      const firstString = value.find((item) => typeof item === "string" && item.trim());
+      if (typeof firstString === "string") {
+        return firstString.trim();
+      }
+    }
+  }
+
+  for (const value of Object.values(node)) {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (item && typeof item === "object") {
+          const found = findStringArrayFirstByCandidates(item, candidates);
+          if (found) {
+            return found;
+          }
+        }
+      }
+    } else if (value && typeof value === "object") {
+      const found = findStringArrayFirstByCandidates(value, candidates);
+      if (found) {
+        return found;
+      }
+    }
+  }
+
+  return undefined;
+};
+
 const extractTextFromPayload = (payload) =>
   findStringByCandidates(payload, ["text", "transcript", "output_text", "content"]);
 
@@ -784,7 +820,7 @@ const extractImageCandidateFromPayload = (payload) => {
     "url",
     "output_url",
     "imageUrl",
-  ]);
+  ]) || findStringArrayFirstByCandidates(payload, ["image_urls", "urls"]);
   if (typeof imageUrl === "string" && imageUrl.startsWith("http")) {
     return { url: imageUrl.trim() };
   }
@@ -820,7 +856,7 @@ const extractVideoCandidateFromPayload = (payload) => {
     "url",
     "output_url",
     "videoUrl",
-  ]);
+  ]) || findStringArrayFirstByCandidates(payload, ["video_urls", "urls"]);
   if (typeof videoUrl === "string" && videoUrl.startsWith("http")) {
     return { url: videoUrl.trim() };
   }
